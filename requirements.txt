@@ -1,0 +1,8 @@
+fastapi==0.115.12
+uvicorn==0.34.3
+astropy==6.1.7
+numpy==2.2.6
+httpx==0.28.1
+pytest==8.3.5
+python-multipart==0.0.20
+scipy==1.15.3

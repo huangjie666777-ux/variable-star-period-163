@@ -9,7 +9,7 @@ import numpy as np
 
 # Search budget (requirement 4): bounded work, deterministic failure.
 MAX_TRI_STARS_SRC = 18       # brightest detected sources used for triangles
-MAX_TRI_STARS_CAT = 30       # catalog stars used for triangles
+MAX_TRI_STARS_CAT = 40       # catalog stars used for triangles
 MATCH_TIME_BUDGET_S = 20.0
 INVARIANT_RTOL = 0.02        # relative tolerance on triangle side ratios
 
@@ -101,7 +101,16 @@ def _vote_transforms(src_xy, cat_xy, src_tris, cat_tris,
                     scale = float(np.sqrt(abs(det)))
                     if not (scale_min <= scale <= scale_max):
                         continue
+                    # Vote on the full similarity: scale, rotation and
+                    # translation.  Without the rotation bin, triangle pairs
+                    # that agree on scale+translation but encode different
+                    # rotations land in one bin and their averaged matrix is
+                    # meaningless -- which made matching depend on which
+                    # catalog stars happened to enter the triangle pool.
+                    angle = float(np.arctan2(A[1, 0] - A[0, 1],
+                                             A[0, 0] + A[1, 1]))
                     key = (round(np.log(scale) / 0.01),
+                           round(angle / 0.02),
                            round(tb[0] / 3.0), round(tb[1] / 3.0))
                     ballots.setdefault(key, []).append((A, tb))
     ranked = sorted(ballots.items(), key=lambda kv: -len(kv[1]))[:20]
@@ -124,6 +133,16 @@ def match(src_xy: np.ndarray, cat_xy: np.ndarray,
     deadline = time.monotonic() + MATCH_TIME_BUDGET_S
     if len(src_xy) < 3 or len(cat_xy) < 3:
         raise MatchError("too few sources or catalog stars for geometric matching")
+
+    # The triangle pool must not depend on the caller's catalog ordering:
+    # select the 30 stars nearest the catalog centroid, with deterministic
+    # coordinate tie-breaking, so permuting the input list changes nothing.
+    centroid = cat_xy.mean(axis=0)
+    radius = np.hypot(*(cat_xy - centroid).T)
+    cat_order = np.lexsort((np.round(cat_xy[:, 1], 6),
+                            np.round(cat_xy[:, 0], 6),
+                            np.round(radius, 6)))
+    cat_xy = cat_xy[cat_order]
 
     src_tris = _triangles(src_xy, MAX_TRI_STARS_SRC)
     cat_tris = _triangles(cat_xy, MAX_TRI_STARS_CAT)
@@ -175,7 +194,7 @@ def match(src_xy: np.ndarray, cat_xy: np.ndarray,
             continue
         used_c.add(ci)
         used_s.add(si)
-        pairs.append((int(si), int(ci)))
+        pairs.append((int(si), int(cat_order[ci])))
     if len(pairs) < 6:
         raise MatchError("fewer than 6 one-to-one pairs after matching")
     return pairs, A, b

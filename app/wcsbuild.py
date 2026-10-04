@@ -1,13 +1,21 @@
 """Build a TAN WCS from the solved affine and merge it into the FITS HDU (req. 5)."""
 from __future__ import annotations
 
+import re
+
 import numpy as np
 from astropy.io import fits
 
 # Old-WCS keywords that must be removed to avoid conflicting solutions.
-_OLD_WCS_PREFIXES = ("CD", "PC", "CDELT", "CROTA", "CRPIX", "CRVAL", "CTYPE",
-                     "CUNIT", "PV", "PS", "WCSAXES", "A_", "B_", "AP_", "BP_",
-                     "LONPOLE", "LATPOLE", "RADESYS", "EQUINOX", "EPOCH")
+# Numbered keywords are matched exactly (e.g. PC1_1, CDELT2, PV2_3) so that
+# unrelated observing headers that merely share a prefix (PCOUNT, PSFREF,
+# CTYPE-like custom keys, ...) are preserved.
+_OLD_WCS_PATTERNS = tuple(re.compile(p) for p in (
+    r"CD\d+_\d+", r"PC\d+_\d+", r"PV\d+_\d+", r"PS\d+_\d+",
+    r"CDELT\d+", r"CROTA\d+", r"CRPIX\d+", r"CRVAL\d+",
+    r"CTYPE\d+", r"CUNIT\d+",
+    r"A_\d+_\d+", r"B_\d+_\d+", r"AP_\d+_\d+", r"BP_\d+_\d+",
+))
 _OLD_WCS_EXACT = {"WCSAXES", "LONPOLE", "LATPOLE", "RADESYS", "EQUINOX", "EPOCH"}
 
 
@@ -41,13 +49,13 @@ def strip_old_wcs(header: fits.Header) -> None:
         if key in _OLD_WCS_EXACT:
             del header[key]
             continue
-        for pre in _OLD_WCS_PREFIXES:
-            if key.startswith(pre) and key not in ("COMMENT", "HISTORY"):
-                try:
-                    del header[key]
-                except KeyError:
-                    pass
-                break
+        if key in ("COMMENT", "HISTORY"):
+            continue
+        if any(p.fullmatch(key) for p in _OLD_WCS_PATTERNS):
+            try:
+                del header[key]
+            except KeyError:
+                pass
 
 
 def solved_fits_bytes(hdu: fits.PrimaryHDU, wcs_header: dict) -> bytes:
@@ -61,4 +69,3 @@ def solved_fits_bytes(hdu: fits.PrimaryHDU, wcs_header: dict) -> bytes:
     buf = io.BytesIO()
     out.writeto(buf, overwrite=True)
     return buf.getvalue()
-

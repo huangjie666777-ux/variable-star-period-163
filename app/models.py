@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Server-side resource limits (requirement 1).
 MAX_IMAGE_PIXELS = 4096 * 4096
@@ -11,6 +11,8 @@ MAX_IMAGE_SIDE = 8192
 MAX_CATALOG_STARS = 2000
 MAX_DETECTED_SOURCES = 500
 MAX_FITS_BYTES = 64 * 1024 * 1024
+MIN_PHOTOMETRY_FRAMES = 2
+MAX_PHOTOMETRY_FRAMES = 20
 
 
 class CatalogStar(BaseModel):
@@ -64,3 +66,69 @@ class SolveResponse(BaseModel):
     pairs: List[PairOut]
     wcs: dict
 
+
+# ---------------------------------------------------------------------------
+# Differential aperture photometry (requirements 1-4)
+# ---------------------------------------------------------------------------
+
+class ReferenceStar(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    mag: float = Field(gt=-30.0, lt=30.0, description="known catalog magnitude")
+
+
+class PhotometryParams(BaseModel):
+    solve: SolveParams
+    target_id: str = Field(min_length=1, max_length=64)
+    references: List[ReferenceStar] = Field(min_length=3, max_length=50)
+    aperture_radius: float = Field(gt=0.0, le=200.0, description="pixels")
+    annulus_inner: float = Field(gt=0.0, le=500.0, description="pixels")
+    annulus_outer: float = Field(gt=0.0, le=1000.0, description="pixels")
+    gain: float = Field(gt=0.0, le=1e6, description="electrons per ADU")
+    read_noise: float = Field(ge=0.0, le=1e4, description="electrons")
+
+    @model_validator(mode="after")
+    def _check_relations(self):
+        if not (self.aperture_radius < self.annulus_inner < self.annulus_outer):
+            raise ValueError(
+                "radii must satisfy aperture_radius < annulus_inner < annulus_outer")
+        cat_ids = {s.id for s in self.solve.catalog}
+        if self.target_id not in cat_ids:
+            raise ValueError("target_id is not present in the solve catalog")
+        ref_ids = [r.id for r in self.references]
+        if len(set(ref_ids)) != len(ref_ids):
+            raise ValueError("reference star ids must be unique")
+        if self.target_id in ref_ids:
+            raise ValueError("target star must not appear among the references")
+        missing = [i for i in ref_ids if i not in cat_ids]
+        if missing:
+            raise ValueError(f"reference ids not in catalog: {missing}")
+        return self
+
+
+class ExcludedReference(BaseModel):
+    id: str
+    reason: str
+
+
+class FrameResult(BaseModel):
+    index: int
+    filename: str
+    status: str  # "ok" or "failed"
+    reason: Optional[str] = None
+    mjd: Optional[float] = None
+    exptime: Optional[float] = None
+    flux_rate: Optional[float] = None
+    flux_rate_err: Optional[float] = None
+    mag: Optional[float] = None
+    mag_err: Optional[float] = None
+    zero_point: Optional[float] = None
+    zero_point_err: Optional[float] = None
+    references_used: List[str] = []
+    references_excluded: List[ExcludedReference] = []
+
+
+class PhotometryResponse(BaseModel):
+    photometry_id: str
+    n_frames: int
+    n_ok: int
+    frames: List[FrameResult]

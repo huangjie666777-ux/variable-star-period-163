@@ -129,6 +129,91 @@ class FrameResult(BaseModel):
 
 class PhotometryResponse(BaseModel):
     photometry_id: str
+    target_id: str = ""
     n_frames: int
     n_ok: int
     frames: List[FrameResult]
+
+
+# ---------------------------------------------------------------------------
+# Multi-night period search (requirement 5)
+# ---------------------------------------------------------------------------
+
+class PeriodBatch(BaseModel):
+    night_id: str = Field(min_length=1, max_length=64)
+    photometry: PhotometryResponse
+
+
+class PeriodogramParams(BaseModel):
+    batches: List[PeriodBatch] = Field(min_length=1, max_length=100)
+    period_min: float = Field(gt=0.0, le=1e6, description="days")
+    period_max: float = Field(gt=0.0, le=1e7, description="days")
+
+    @model_validator(mode="after")
+    def _check_period_order(self):
+        if self.period_max <= self.period_min:
+            raise ValueError("period_max must be greater than period_min")
+        return self
+
+
+class ExcludedPointOut(BaseModel):
+    night_id: str
+    batch_index: int
+    frame_index: int
+    filename: str
+    reason: str
+    mjd: Optional[float] = None
+
+
+class PeakOut(BaseModel):
+    frequency: float          # cycles/day
+    period: float             # days
+    power: float
+    boundary: bool = False
+
+
+class DegenerateFitOut(BaseModel):
+    frequency: float
+    reason: str
+
+
+class PhasedPointOut(BaseModel):
+    night_id: str
+    batch_index: int
+    frame_index: int
+    filename: str
+    mjd: float
+    mag: float
+    mag_err: float
+    phase: float
+    detrended_mag: float      # mag minus this night's fitted constant
+    model_mag: float          # full joint model (night constant + sinusoid)
+    residual: float
+
+
+class CandidateModel(BaseModel):
+    period: float
+    phase_zero_mjd: float
+    amplitude: float
+    night_offsets: dict
+
+
+class PeriodogramResponse(BaseModel):
+    periodogram_id: str
+    target_id: str
+    n_points: int
+    n_nights: int
+    n_excluded: int
+    span_days: float
+    df: float
+    frequencies: List[float]
+    power: List[Optional[float]]     # null where the fit was degenerate
+    window_power: List[Optional[float]]
+    peaks: List[PeakOut]
+    warnings: List[str]
+    degenerate_fits: List[DegenerateFitOut]
+    excluded: List[ExcludedPointOut]
+    candidate_period: Optional[float] = None
+    no_candidate_reason: Optional[str] = None
+    candidate_model: Optional[CandidateModel] = None
+    phased_points: Optional[List[PhasedPointOut]] = None

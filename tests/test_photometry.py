@@ -1,6 +1,7 @@
 """End-to-end tests for differential aperture photometry (requirements 1-4)."""
 from __future__ import annotations
 
+import csv
 import io
 import json
 
@@ -184,6 +185,33 @@ def test_failed_frame_kept_others_continue(client):
     ok = [f for f in body["frames"] if f["status"] == "ok"]
     good = np.delete(true_mags, 2)
     assert np.allclose([f["mag"] for f in ok], good, atol=0.05)
+
+
+def test_failed_frame_keeps_known_mjd_and_csv_quoting(client):
+    # A frame with valid headers but no detectable sources fails the solve;
+    # its MJD/EXPTIME must survive in the failure record.
+    frames, params, _, _ = make_sequence(seed=4)
+    blank = np.full((NY, NX), 500.0, dtype=np.float32)
+    hdu = fits.PrimaryHDU(data=blank)
+    hdu.header["DATE-OBS"] = "2023-06-16T13:00:00"
+    hdu.header["EXPTIME"] = 60.0
+    buf = io.BytesIO()
+    hdu.writeto(buf)
+    frames = frames + [("weird,name,fits.fits", buf.getvalue())]
+    r = post_photometry(client, frames, params)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    failed = [f for f in body["frames"] if f["status"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["mjd"] is not None
+    assert failed[0]["exptime"] == 60.0
+    # The comma-containing filename must not shift CSV columns.
+    r2 = client.get(f"/api/photometry/{body['photometry_id']}/csv")
+    assert r2.status_code == 200
+    rows = list(csv.reader(io.StringIO(r2.text)))
+    assert all(len(row) == len(rows[0]) == 14 for row in rows)
+    bad = [row for row in rows if row[1] == "weird,name,fits.fits"]
+    assert len(bad) == 1 and bad[0][2] == "failed"
 
 
 def test_validation_errors(client):

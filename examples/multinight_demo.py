@@ -1,0 +1,150 @@
+"""Multi-night period-search demo: synthetic eclipsing-style variable.
+
+Generates 3 nights x 8 frames (target sinusoidal with period 0.62 d,
+transparency drifting per frame, each night offset by a different zero
+point), runs /api/photometry per night, then posts all three responses to
+/api/periodogram and prints the recovered candidate period.
+
+Usage:
+    .venv/bin/python examples/multinight_demo.py [--url http://127.0.0.1:8152]
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import sys
+from pathlib import Path
+
+import httpx
+import numpy as np
+from astropy.io import fits
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.match import project_tangent
+
+CENTER_RA, CENTER_DEC = 150.0, 20.0
+SCALE = 1.3
+NY, NX = 300, 300
+GAIN, READ_NOISE = 2.5, 4.0
+TRUE_PERIOD = 0.62          # days
+N_NIGHTS, FRAMES_PER_NIGHT = 3, 8
+MJD0 = 60100.0
+
+
+def build_nights(seed=11):
+    rng = np.random.default_rng(seed)
+    n_bg = 40
+    ang = rng.uniform(0, 2 * np.pi, n_bg)
+    rad = rng.uniform(0.032, 0.048, n_bg)
+    ras = CENTER_RA + rad * np.cos(ang) / np.cos(np.deg2rad(CENTER_DEC))
+    decs = CENTER_DEC + rad * np.sin(ang)
+    bg_mags = rng.uniform(13.0, 16.0, n_bg)
+    ids = [f"bg{i}" for i in range(n_bg)]
+
+    offs = np.array([[0.0, 0.0], [0.02, 0.0], [-0.02, 0.0],
+                     [0.0, 0.02], [0.0, -0.02]])
+    ids += ["varstar", "ref0", "ref1", "ref2", "ref3"]
+    extra_mags = [14.0, 12.0, 12.5, 13.0, 13.5]
+    ras = np.concatenate(
+        [ras, CENTER_RA + offs[:, 0] / np.cos(np.deg2rad(CENTER_DEC))])
+    decs = np.concatenate([decs, CENTER_DEC + offs[:, 1]])
+
+    xi, eta = project_tangent(ras, decs, CENTER_RA, CENTER_DEC)
+    th = np.deg2rad(20.0)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    pix = np.column_stack([xi, eta]) @ (R / SCALE).T + np.array([NX / 2, NY / 2])
+
+    yy, xx = np.mgrid[0:NY, 0:NX]
+    nights = []
+    for night in range(N_NIGHTS):
+        night_zp_offset = 0.15 * (night - 1)   # per-night zero-point shift
+        frames = []
+        for f in range(FRAMES_PER_NIGHT):
+            mjd = MJD0 + night + (f + 0.5) / 24.0
+            transparency = 1.0 + 0.2 * np.sin(2 * np.pi * f
+                                              / FRAMES_PER_NIGHT)
+            true_mag = 14.0 + 0.4 * np.sin(2 * np.pi * (mjd - MJD0)
+                                           / TRUE_PERIOD)
+            img = rng.normal(500.0, 3.0, (NY, NX))
+            mags = np.concatenate([bg_mags, extra_mags])
+            mags[n_bg] = true_mag
+            for i in range(len(ids)):
+                flux = (10 ** ((25.0 - mags[i] + night_zp_offset) / 2.5)
+                        * 60.0 * transparency / GAIN)
+                img += flux * np.exp(-((xx - pix[i, 0]) ** 2
+                                       + (yy - pix[i, 1]) ** 2) / (2 * 1.5 ** 2))
+            img = rng.poisson(np.clip(img, 0, None) * GAIN) / GAIN
+            hdu = fits.PrimaryHDU(data=img.astype(np.float32))
+            hdu.header["DATE-OBS"] = (
+                f"2023-06-{15 + night:02d}T{13 + f:02d}:00:00")
+            hdu.header["EXPTIME"] = 60.0
+            buf = io.BytesIO()
+            hdu.writeto(buf)
+            frames.append((f"night{night + 1}_{f:02d}.fits", buf.getvalue()))
+        nights.append(frames)
+
+    catalog = [{"id": i, "ra": float(r), "dec": float(d)}
+               for i, r, d in zip(ids, ras, decs)]
+    params = {
+        "solve": {"catalog": catalog, "center_ra": CENTER_RA,
+                  "center_dec": CENTER_DEC, "pixel_scale_min": 1.0,
+                  "pixel_scale_max": 1.6, "rms_max": 0.8},
+        "target_id": "varstar",
+        "references": [{"id": f"ref{i}", "mag": m}
+                       for i, m in enumerate([12.0, 12.5, 13.0, 13.5])],
+        "aperture_radius": 4.0, "annulus_inner": 8.0, "annulus_outer": 13.0,
+        "gain": GAIN, "read_noise": READ_NOISE,
+    }
+    return nights, params
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://127.0.0.1:8152")
+    args = ap.parse_args()
+
+    nights, phot_params = build_nights()
+    batches = []
+    for night, frames in enumerate(nights):
+        files = [("images", (n, b, "application/fits")) for n, b in frames]
+        r = httpx.post(f"{args.url}/api/photometry", files=files,
+                       data={"params": json.dumps(phot_params)},
+                       timeout=300.0)
+        r.raise_for_status()
+        body = r.json()
+        print(f"night {night + 1}: photometry ok {body['n_ok']}/"
+              f"{body['n_frames']}")
+        batches.append({"night_id": f"night{night + 1}",
+                        "photometry": body})
+
+    req = {"batches": batches, "period_min": 0.3, "period_max": 2.0}
+    r = httpx.post(f"{args.url}/api/periodogram",
+                   data={"params": json.dumps(req)}, timeout=300.0)
+    r.raise_for_status()
+    body = r.json()
+    print(f"points {body['n_points']}  nights {body['n_nights']}  "
+          f"span {body['span_days']:.2f} d  (true period {TRUE_PERIOD} d)")
+    print(f"{'rank':>4} {'period [d]':>10} {'power':>7} {'boundary':>8}")
+    for rank, pk in enumerate(body["peaks"], 1):
+        print(f"{rank:>4} {pk['period']:10.5f} {pk['power']:7.3f} "
+              f"{str(pk['boundary']):>8}")
+    for w in body["warnings"]:
+        print(f"warning: {w}")
+    if body["candidate_period"]:
+        print(f"candidate period: {body['candidate_period']:.5f} d "
+              f"(amplitude {body['candidate_model']['amplitude']:.3f} mag) "
+              f"-- candidate, not confirmed")
+        csv = httpx.get(
+            f"{args.url}/api/periodogram/{body['periodogram_id']}/csv")
+        csv.raise_for_status()
+        out = Path(__file__).parent / "periodogram_phased.csv"
+        out.write_text(csv.text)
+        print(f"phased CSV saved to {out}")
+    else:
+        print(f"no candidate: {body['no_candidate_reason']}")
+
+
+if __name__ == "__main__":
+    main()

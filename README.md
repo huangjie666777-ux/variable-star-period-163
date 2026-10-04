@@ -31,8 +31,16 @@ ICRS 星表,不使用原 WCS 或在线服务。定位输出配对、残差、RMS
   三项。非有限、饱和、越界、拥挤、非正通量分别以原因标记,不给星等。
 - app/calibrate.py — 逐帧零点:zp_i = mag_i + 2.5*log10(rate_i),中位数 +
   MAD 稳健剔除异常参考星(不少于 3 颗,否则该帧失败);目标星等与误差
-  由通量误差与零点误差传播合成。目标星不参与定标。
-- app/main.py — FastAPI 入口、参数校验、结果存取、CSV 生成。
+  由通量误差与零点误差传播合成。目标星不参与定标。校准失败时
+  CalibrationError 仍携带被剔除参考星的索引。
+- app/period.py — 多夜周期识别:跨批次汇集有效测光点(记录排除原因与
+  批次/帧来源),按 1/err^2 加权,在每个试验频率上联合拟合各夜独立
+  常数与共享 sin/cos(不先减每夜均值);功率为相对仅含夜常数模型的
+  加权残差减少比例;时间以最早有效 MJD 为零点保持精度;退化拟合
+  计数并标注原因。另给出采样窗功率、候选峰选取与相位折叠。
+- app/main.py — FastAPI 入口、参数校验、结果存取、CSV 生成(csv 模块
+  正确转义含逗号的文件名/原因)。失败帧保留已知 MJD/EXPTIME 与
+  参考星排除原因。
 - app/models.py — 请求/响应模型与服务器端限制。
 
 ## API
@@ -65,9 +73,34 @@ GET /api/solve/{solve_id}/fits 下载写入新 WCS 的 FITS。
 非法输入返回 422。
 
 每帧独立定位与测光;单帧失败(定位失败、头缺失、可用参考星不足 3 颗等)
-保留失败记录与原因,其余帧继续。返回按曝光中点排序的帧列表:MJD、
-EXPTIME、扣背景通量率及误差、目标星等及误差、零点及误差、采用与排除的
-参考星(含排除原因)。GET /api/photometry/{photometry_id}/csv 下载同内容 CSV。
+保留失败记录与原因(以及已知的 MJD/EXPTIME 和参考星排除原因),其余帧
+继续。返回按曝光中点排序的帧列表:target_id、MJD、EXPTIME、扣背景通量率
+及误差、目标星等及误差、零点及误差、采用与排除的参考星(含排除原因)。
+GET /api/photometry/{photometry_id}/csv 下载同内容 CSV。
+
+### POST /api/period (application/json)
+
+多夜变星周期识别。请求体:
+  {"batches": [{"night_id": "night1", "photometry": <一次 /api/photometry
+   的完整响应>}, ...至少 2 个不同 night_id...],
+   "period_min_days": 0.2, "period_max_days": 2.0}
+
+所有批次须为同一 target_id;周期界须为正且递增。仅 status=ok 且 MJD、
+星等有限、星等误差为正的帧参与;被排除的帧连同原因与批次/帧来源一并
+返回(excluded_points)。有效点须为 20-2000 个、覆盖至少 2 夜且时间
+跨度为正,否则 422。
+
+按 1/err^2 加权,在频率轴(1/period_max 至 1/period_min,步长不超过
+1/(5*跨度),最多 20000 点,超限 422)扫描:每个频率联合拟合各夜独立
+常数与共享 sin/cos,功率为相对仅含夜常数模型的加权残差减少比例。
+返回频率/功率数组、采样窗功率、最多 3 个间隔至少 1/跨度的局部峰
+(按功率排序,同值取较长周期)及警告(边界峰、基线不足两周期等)。
+最高峰只是候选,不是已确认周期。
+
+按最强候选与最早有效 MJD(相位零点)折叠:每点给出相位、去夜零点
+星等、模型值与残差,并保留批次/帧来源。GET /api/period/{period_id}/csv
+下载与 JSON 一致的折叠光变曲线 CSV。无可用候选时 candidates 为空且
+no_candidate_reason 说明原因。
 
 ## 运行与验证
 
@@ -86,6 +119,22 @@ EXPTIME、扣背景通量率及误差、目标星等及误差、零点及误差�
 
 ## 光变示例
 
+多夜周期示例:examples/period_demo.py 生成 3 夜合成序列(目标以 0.6 d
+周期变化,每夜带额外零点偏移),逐夜测光后调用 /api/period 恢复周期,
+折叠光变曲线存为 examples/period_fold.csv:
+
+    .venv/bin/python examples/period_demo.py --url http://127.0.0.1:8152
+
+恢复的候选周期与真值 0.6 d 一致,夜间零点偏移被联合拟合吸收。
+
+多夜周期示例:examples/period_demo.py 生成 3 夜合成序列(目标以 0.6 d
+周期变化,每夜带额外零点偏移),逐夜测光后调用 /api/period 恢复周期,
+折叠光变曲线存为 examples/period_fold.csv:
+
+    .venv/bin/python examples/period_demo.py --url http://127.0.0.1:8152
+
+恢复的候选周期与真值 0.6 d 一致,夜间零点偏移被联合拟合吸收。
+
 examples/lightcurve_demo.py 生成 6 帧合成序列(目标按 +-0.3 mag 变化,
 透明度按 +-0.25 mag 漂移),POST 到运行中的服务并打印恢复的光变曲线,
 CSV 存为 examples/lightcurve.csv:
@@ -96,12 +145,18 @@ CSV 存为 examples/lightcurve.csv:
 
 ## 测试范围
 
+- tests/test_period.py — 多夜周期识别:带夜零点偏移的合成光变曲线恢复
+  注入周期;排除帧的原因与来源;非法输入(点太少、单夜、周期界非递增、
+  频点超限、目标不一致、夜 ID 重复)返回 422;无候选原因与短基线警告;
+  折叠 CSV 与 JSON 一致。
+
 - tests/test_solver.py — 任意旋转/镜像/漏检/假源的定位;背向星、
   不可能 RMS、非法参数拒绝;下载 FITS 的 WCS 回算与观测头保留。
 - tests/test_photometry.py — 变源 + 透明度漂移序列的差分测光:
   恢复星等跟踪真值、零点与透明度相关、常星光变曲线平坦;
   环星表顺序打乱后定位结果不变;PCOUNT/PSFREF 等观测头不被误删;
   缺 DATE-OBS 帧记为失败、其余帧继续;异常参考星被剔除并记录原因;
+  校准失败帧保留已知 MJD 与参考星排除原因;含逗号文件名 CSV 不错列;
   非法参数(目标充当参考星、半径次序错误、帧数越界等)返回 422。
 
 ## 范围说明
@@ -110,5 +165,6 @@ CSV 存为 examples/lightcurve.csv:
 - 投影为标准 TAN(gnomonic),无视场畸变改正。
 - 孔径测光为圆形孔径 + 圆环背景,不做 PSF 拟合;孔径内按整像素求和。
 - 所有帧须为同一滤镜;输入图像不会被修改。
-- 结果保存在内存中,服务重启后 solve_id / photometry_id 失效。
-
+- 结果保存在内存中,服务重启后 solve_id / photometry_id / period_id 失效。
+- 周期搜索为单正弦模型的加权扫描,最高峰仅为候选;不做多阶傅里叶
+  拟合、不评估统计显著性,也不处理非正弦光变形状。

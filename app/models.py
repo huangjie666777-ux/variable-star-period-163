@@ -129,6 +129,93 @@ class FrameResult(BaseModel):
 
 class PhotometryResponse(BaseModel):
     photometry_id: str
+    target_id: str
     n_frames: int
     n_ok: int
     frames: List[FrameResult]
+
+
+# ---------------------------------------------------------------------------
+# Multi-night period search (requirement 5)
+# ---------------------------------------------------------------------------
+
+MIN_PERIOD_POINTS = 20
+MAX_PERIOD_POINTS = 2000
+MAX_PERIOD_FREQUENCIES = 20000
+MAX_PERIOD_BATCHES = 50
+
+
+class PeriodBatch(BaseModel):
+    """One observing night: an existing photometry response plus a night id."""
+    night_id: str = Field(min_length=1, max_length=64)
+    photometry: PhotometryResponse
+
+
+class PeriodSearchParams(BaseModel):
+    batches: List[PeriodBatch] = Field(min_length=2,
+                                       max_length=MAX_PERIOD_BATCHES)
+    period_min_days: float = Field(gt=0.0, le=1e6)
+    period_max_days: float = Field(gt=0.0, le=1e9)
+
+    @model_validator(mode="after")
+    def _check_relations(self):
+        if not self.period_max_days > self.period_min_days:
+            raise ValueError("period_max_days must be > period_min_days")
+        night_ids = [b.night_id for b in self.batches]
+        if len(set(night_ids)) != len(night_ids):
+            raise ValueError("night_id values must be unique across batches")
+        target_ids = {b.photometry.target_id for b in self.batches}
+        if len(target_ids) != 1 or not next(iter(target_ids)):
+            raise ValueError(
+                "all batches must carry the same non-empty target_id")
+        return self
+
+
+class ExcludedPoint(BaseModel):
+    batch_index: int
+    night_id: str
+    frame_index: Optional[int] = None
+    filename: Optional[str] = None
+    reason: str
+
+
+class PeriodCandidate(BaseModel):
+    frequency: float          # cycles per day
+    period_days: float
+    power: float
+
+
+class FoldedPoint(BaseModel):
+    batch_index: int
+    night_id: str
+    frame_index: int
+    filename: str
+    mjd: float
+    phase: float
+    mag: float
+    mag_err: float
+    mag_night_zero_removed: float
+    model_mag: float
+    residual: float
+
+
+class PeriodSearchResponse(BaseModel):
+    period_id: str
+    target_id: str
+    n_points: int
+    n_nights: int
+    mjd_span_days: float
+    period_min_days: float
+    period_max_days: float
+    excluded_points: List[ExcludedPoint]
+    frequencies: List[float]
+    powers: List[Optional[float]]
+    window_powers: List[float]
+    n_degenerate_fits: int
+    degenerate_reason: Optional[str] = None
+    candidates: List[PeriodCandidate]
+    no_candidate_reason: Optional[str] = None
+    warnings: List[str]
+    phase_zero_mjd: Optional[float] = None
+    best_candidate: Optional[PeriodCandidate] = None
+    fold_points: List[FoldedPoint] = []

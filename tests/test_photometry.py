@@ -1,6 +1,8 @@
 """End-to-end tests for differential aperture photometry (requirements 1-4)."""
 from __future__ import annotations
 
+import csv
+import csv
 import io
 import json
 
@@ -237,3 +239,80 @@ def test_solve_order_independent_and_observing_headers_kept(client):
     hdul = fits.open(io.BytesIO(r2.content))
     assert hdul[0].header["TELESCOP"] == "SYNTH"
     assert hdul[0].header["CTYPE1"] == "RA---TAN"
+
+
+def test_csv_quoting_and_failed_frame_keeps_mjd(client):
+    """Filenames with commas must not shift CSV columns; a failed frame
+    keeps its known MJD/EXPTIME."""
+    frames, params, _, _ = make_sequence(seed=6)
+    # Comma in a filename used to break column alignment.
+    frames[0] = ("night1,partA.fits", frames[0][1])
+    # Frame 1: valid headers but an image the solver cannot handle.
+    hdu = fits.PrimaryHDU(data=np.full((NY, NX), np.nan, dtype=np.float32))
+    hdu.header["DATE-OBS"] = "2023-06-15T20:00:00"
+    hdu.header["EXPTIME"] = 60.0
+    buf = io.BytesIO()
+    hdu.writeto(buf)
+    frames[1] = ("broken.fits", buf.getvalue())
+
+    r = post_photometry(client, frames, params)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    failed = [f for f in body["frames"] if f["status"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["filename"] == "broken.fits"
+    assert failed[0]["mjd"] is not None  # known MJD is preserved
+    assert failed[0]["exptime"] == 60.0
+
+    r2 = client.get(f"/api/photometry/{body['photometry_id']}/csv")
+    assert r2.status_code == 200
+    rows = list(csv.reader(io.StringIO(r2.text)))
+    assert len(rows) == 1 + len(frames)
+    header = rows[0]
+    assert header[1] == "filename" and header[8] == "mag"
+    for row in rows[1:]:
+        assert len(row) == len(header)  # comma filename did not add a column
+    by_name = {row[1]: row for row in rows[1:]}
+    assert "night1,partA.fits" in by_name
+    assert by_name["broken.fits"][2] == "failed"
+    assert by_name["broken.fits"][4] != ""  # mjd column filled
+
+
+def test_failed_frame_keeps_mjd_and_reference_reasons(client):
+    """A frame that fails at calibration must still report its known MJD
+    and why each reference star was excluded."""
+    frames, params, _, _ = make_sequence(seed=5)
+    # One of three references has a badly wrong magnitude: after outlier
+    # rejection fewer than 3 calibrators remain and every frame fails.
+    params["references"] = params["references"][:3]
+    params["references"][0]["mag"] = 5.0
+    r = post_photometry(client, frames, params)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["n_ok"] == 0
+    for f in body["frames"]:
+        assert f["status"] == "failed"
+        assert f["mjd"] is not None          # known MJD is preserved
+        assert f["exptime"] == 60.0
+        assert "reference" in f["reason"]
+        reasons = {e["id"]: e["reason"] for e in f["references_excluded"]}
+        assert reasons.get("ref0") == "zero_point_outlier"
+
+
+def test_csv_handles_comma_in_filename(client):
+    """Filenames containing commas must not shift CSV columns."""
+    frames, params, _, _ = make_sequence(seed=6)
+    frames = [(f"night1,{i:02d}.fits", blob) for i, (_, blob) in enumerate(frames)]
+    r = post_photometry(client, frames, params)
+    assert r.status_code == 200, r.text
+    pid = r.json()["photometry_id"]
+    r2 = client.get(f"/api/photometry/{pid}/csv")
+    assert r2.status_code == 200
+    rows = list(csv.reader(io.StringIO(r2.text)))
+    header = rows[0]
+    assert header[:3] == ["index", "filename", "status"]
+    for row in rows[1:]:
+        assert len(row) == len(header)
+        assert row[1].startswith("night1,")
+        assert row[2] == "ok"
+        float(row[8])  # mag column still numeric

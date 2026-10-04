@@ -15,7 +15,11 @@ MIN_REJECT_WIDTH = 0.05  # mag; never reject tighter than this
 
 
 class CalibrationError(ValueError):
-    pass
+    """Calibration failure; carries indices of rejected reference stars."""
+
+    def __init__(self, message, rejected=None):
+        super().__init__(message)
+        self.rejected = list(rejected or [])
 
 
 def mag_error(rate: float, rate_err: float) -> float:
@@ -50,7 +54,8 @@ def estimate_zero_point(mags, rates, rate_errs):
     if keep.sum() < MIN_CALIBRATORS:
         raise CalibrationError(
             f"fewer than {MIN_CALIBRATORS} reference stars remain after "
-            f"outlier rejection ({int(keep.sum())} left)")
+            f"outlier rejection ({int(keep.sum())} left)",
+            rejected=np.flatnonzero(~keep).tolist())
 
     kept = np.flatnonzero(keep)
     vals = zp_i[kept]
